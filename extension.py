@@ -274,6 +274,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             
             self.test_cache[cache_key] = current_time
             
+            # Test regular parameters
             for param in parameters:
                 param_name = param.getName()
                 param_value = param.getValue()
@@ -298,9 +299,294 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     self.log_skip_reason("XSS test skipped - not a GET parameter", param_name, "Type: " + str(param_type))
                 
                 self.update_status()
+            
+            # Test JSON body parameters if present
+            self.test_json_body(messageInfo, request_info)
                 
         except Exception as e:
             print("Security test error: " + str(e))
+    
+    def test_json_body(self, messageInfo, request_info):
+        """Test JSON body parameters for SQLi"""
+        try:
+            # Check if request has JSON content type
+            headers = request_info.getHeaders()
+            is_json = False
+            
+            for header in headers:
+                if header.lower().startswith("content-type:") and "application/json" in header.lower():
+                    is_json = True
+                    break
+            
+            if not is_json:
+                return
+            
+            # Get request body
+            body_offset = request_info.getBodyOffset()
+            request_bytes = messageInfo.getRequest()
+            
+            if body_offset >= len(request_bytes):
+                return
+            
+            try:
+                body_string = self.helpers.bytesToString(request_bytes[body_offset:])
+                if not body_string.strip():
+                    return
+                
+                # Parse JSON and test string values
+                self.parse_and_test_json(messageInfo, body_string, request_info)
+                
+            except Exception as e:
+                if self.verbose_testing:
+                    self.log_skip_reason("JSON parsing failed", "", str(e))
+                
+        except Exception as e:
+            print("JSON body test error: " + str(e))
+    
+    def parse_and_test_json(self, messageInfo, json_string, request_info):
+        """Parse JSON and test string values for SQLi"""
+        try:
+            import json
+            json_data = json.loads(json_string)
+            
+            # Find all string values in JSON recursively
+            string_params = []
+            self.extract_json_strings(json_data, "", string_params)
+            
+            if not string_params:
+                if self.verbose_testing:
+                    with open(self.test_log_path, 'a') as f:
+                        f.write("  JSON BODY: No string parameters found for testing\n\n")
+                return
+            
+            # Test each string parameter
+            for json_path, value in string_params:
+                # Skip if value already contains quotes
+                if "'" in value or '"' in value:
+                    if self.verbose_testing:
+                        self.log_skip_reason("JSON parameter already contains quotes", json_path, value)
+                    continue
+                
+                self.test_count += 1
+                self.log_json_test_attempt(messageInfo, json_path, value, json_string)
+                self.test_json_sqli(messageInfo, request_info, json_string, json_path, value)
+                self.update_status()
+                
+        except Exception as e:
+            if self.verbose_testing:
+                self.log_skip_reason("JSON parsing error", "", str(e))
+    
+    def extract_json_strings(self, obj, path, results):
+        """Recursively extract string values from JSON object"""
+        try:
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    new_path = path + "." + key if path else key
+                    self.extract_json_strings(value, new_path, results)
+            elif isinstance(obj, list):
+                for i, value in enumerate(obj):
+                    new_path = path + "[" + str(i) + "]"
+                    self.extract_json_strings(value, new_path, results)
+            elif isinstance(obj, str) and len(obj.strip()) > 0:
+                # Only test non-empty strings
+                results.append((path, obj))
+        except Exception:
+            pass  # Skip problematic values
+    
+    def log_json_test_attempt(self, messageInfo, json_path, value, original_json):
+        """Log JSON parameter test attempt"""
+        if not self.verbose_testing:
+            return
+        
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            request_info = self.helpers.analyzeRequest(messageInfo)
+            
+            with open(self.test_log_path, 'a') as f:
+                f.write("-" * 60 + "\n")
+                f.write("JSON TEST ATTEMPT #" + str(self.test_count) + "\n")
+                f.write("Time: " + timestamp + "\n")
+                f.write("Host: " + messageInfo.getHttpService().getHost() + "\n")
+                f.write("URL: " + str(request_info.getUrl()) + "\n")
+                f.write("JSON Path: " + json_path + " = " + value + "\n")
+                f.write("Parameter Type: JSON/BODY\n")
+                f.write("Original JSON: " + original_json[:200] + ("..." if len(original_json) > 200 else "") + "\n")
+                f.write("\n")
+            
+        except Exception as e:
+            print("JSON test log error: " + str(e))
+    
+    def test_json_sqli(self, messageInfo, request_info, original_json, json_path, value):
+        """Test JSON parameter for SQL injection"""
+        try:
+            # Clean value
+            clean_value = value.replace("'", "").replace('"', "")
+            
+            sqli_found = False
+            endpoint_safe = False
+            
+            for quote in ["'", '"']:
+                # Test 1: Add single quote
+                test_value1 = clean_value + quote
+                response1 = self.send_json_test_request(messageInfo, request_info, original_json, json_path, test_value1)
+                
+                if response1:
+                    status1 = self.get_status_code(response1)
+                    is_error1 = self.is_error_response(response1)
+                    
+                    if self.verbose_testing:
+                        self.log_test_detail("JSON SQLi Step 1", json_path, quote, test_value1, status1, is_error1)
+                    
+                    # If single quote returns 200 OK, endpoint is likely safe
+                    if status1 == 200 and not is_error1:
+                        endpoint_safe = True
+                        if self.verbose_testing:
+                            self.log_test_result("JSON SQLi", json_path, "SAFE - Single quote returned 200 OK (endpoint not vulnerable)")
+                        break
+                    
+                    if is_error1:
+                        # Test 2: Add double quote to "fix" syntax
+                        test_value2 = clean_value + quote + quote
+                        response2 = self.send_json_test_request(messageInfo, request_info, original_json, json_path, test_value2)
+                        
+                        if response2:
+                            status2 = self.get_status_code(response2)
+                            is_error2 = self.is_error_response(response2)
+                            
+                            if self.verbose_testing:
+                                self.log_test_detail("JSON SQLi Step 2", json_path, quote + quote, test_value2, status2, is_error2)
+                            
+                            if not is_error2:
+                                sqli_found = True
+                                self.log_json_sqli_vuln(messageInfo, json_path, quote, response1, response2, test_value1, test_value2, original_json)
+                                break
+            
+            if self.verbose_testing and not sqli_found and not endpoint_safe:
+                self.log_test_result("JSON SQLi", json_path, "SAFE - No SQL injection detected")
+                        
+        except Exception as e:
+            print("JSON SQLi test error: " + str(e))
+    
+    def send_json_test_request(self, original_messageInfo, request_info, original_json, json_path, new_value):
+        """Send modified JSON request"""
+        try:
+            import json
+            
+            # Parse original JSON
+            json_data = json.loads(original_json)
+            
+            # Modify the specific path
+            self.set_json_value(json_data, json_path, new_value)
+            
+            # Convert back to JSON string
+            modified_json = json.dumps(json_data)
+            
+            # Create cache key for this specific test
+            test_key = self.get_test_key(original_messageInfo, json_path, new_value)
+            
+            if test_key in self.request_cache:
+                return self.request_cache[test_key]
+            
+            # Build new request with modified JSON
+            headers = request_info.getHeaders()
+            body_offset = request_info.getBodyOffset()
+            
+            # Reconstruct request with new JSON body
+            header_string = "\r\n".join(headers) + "\r\n\r\n"
+            new_request_bytes = self.helpers.stringToBytes(header_string + modified_json)
+            
+            # Send request
+            http_service = original_messageInfo.getHttpService()
+            response = self.callbacks.makeHttpRequest(http_service, new_request_bytes)
+            
+            # Cache the response
+            self.request_cache[test_key] = response
+            return response
+            
+        except Exception as e:
+            print("JSON request error: " + str(e))
+            return None
+    
+    def set_json_value(self, obj, path, value):
+        """Set value at specific JSON path"""
+        try:
+            if "." not in path and "[" not in path:
+                # Simple key
+                if isinstance(obj, dict):
+                    obj[path] = value
+                return
+            
+            # Complex path - split by dots and handle arrays
+            parts = path.split(".")
+            current = obj
+            
+            for i, part in enumerate(parts[:-1]):
+                if "[" in part and "]" in part:
+                    # Array access
+                    key = part.split("[")[0]
+                    index = int(part.split("[")[1].split("]")[0])
+                    current = current[key][index]
+                else:
+                    current = current[part]
+            
+            # Set final value
+            final_part = parts[-1]
+            if "[" in final_part and "]" in final_part:
+                key = final_part.split("[")[0]
+                index = int(final_part.split("[")[1].split("]")[0])
+                current[key][index] = value
+            else:
+                current[final_part] = value
+                
+        except Exception as e:
+            print("JSON path set error: " + str(e))
+    
+    def log_json_sqli_vuln(self, messageInfo, json_path, quote, error_response, success_response, test_value1, test_value2, original_json):
+        """Log JSON SQL injection vulnerability"""
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            request_info = self.helpers.analyzeRequest(messageInfo)
+            
+            with open(self.vuln_log_path, 'a') as f:
+                f.write("=" * 80 + "\n")
+                f.write("JSON SQL INJECTION VULNERABILITY DETECTED\n")
+                f.write("Time: " + timestamp + "\n")
+                f.write("Host: " + messageInfo.getHttpService().getHost() + "\n")
+                f.write("JSON Parameter Path: " + json_path + "\n")
+                f.write("Quote Used: " + quote + "\n")
+                f.write("URL: " + str(request_info.getUrl()) + "\n")
+                f.write("Original JSON: " + original_json[:500] + ("..." if len(original_json) > 500 else "") + "\n")
+                f.write("-" * 80 + "\n")
+                
+                if error_response and error_response.getResponse():
+                    error_info = self.helpers.analyzeResponse(error_response.getResponse())
+                    f.write("ERROR RESPONSE (with " + test_value1 + "):\n")
+                    f.write("Status Code: " + str(error_info.getStatusCode()) + "\n")
+                    
+                    try:
+                        body_offset = error_info.getBodyOffset()
+                        response_bytes = error_response.getResponse()
+                        if body_offset < len(response_bytes):
+                            body = self.helpers.bytesToString(response_bytes[body_offset:])
+                            error_context = self.get_sqli_error_context(body)
+                            if error_context:
+                                f.write("Error Context:\n" + error_context + "\n")
+                    except Exception:
+                        f.write("Error Context: [Could not extract error details]\n")
+                
+                if success_response and success_response.getResponse():
+                    success_info = self.helpers.analyzeResponse(success_response.getResponse())
+                    f.write("\nSUCCESS RESPONSE (with " + test_value2 + "):\n")
+                    f.write("Status Code: " + str(success_info.getStatusCode()) + "\n")
+                
+                f.write("\n")
+            
+            result_text = "[" + timestamp + "] JSON SQLi in '" + json_path + "' at " + str(request_info.getUrl()) + "\n"
+            self.results_area.append(result_text)
+            print("JSON SQL Injection vulnerability found in parameter: " + json_path)
+            
+        except Exception as e:
+            print("JSON SQLi log error: " + str(e))
     
     def get_path_cache_key(self, messageInfo):
         """Create cache key based on URL path only (without query parameters)"""
@@ -321,7 +607,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             return str(time.time())
     
     def get_detailed_cache_key(self, messageInfo, parameters):
-        """Create a cache key that includes URL and original parameter values"""
+        """Create a cache key that includes URL and original parameter values (legacy function)"""
         try:
             request_info = self.helpers.analyzeRequest(messageInfo)
             url = str(request_info.getUrl())
@@ -338,11 +624,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             return str(time.time())
     
     def log_skip_reason(self, reason, param_name, param_value):
-        """Log why a parameter was skipped"""
+        """Log why a parameter or URL was skipped"""
         try:
             with open(self.test_log_path, 'a') as f:
-                f.write("  SKIPPED - " + param_name + ": " + reason + "\n")
-                f.write("    Parameter Value: " + param_value + "\n")
+                if param_name:
+                    f.write("  SKIPPED - " + param_name + ": " + reason + "\n")
+                    f.write("    Parameter Value: " + param_value + "\n")
+                else:
+                    f.write("  SKIPPED - " + reason + "\n")
+                    f.write("    URL: " + param_value + "\n")
                 f.write("\n")
         except Exception as e:
             print("Skip log error: " + str(e))
@@ -397,6 +687,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             clean_value = param_value.replace("'", "").replace('"', "")
             
             sqli_found = False
+            endpoint_safe = False
             
             for quote in ["'", '"']:
                 # Test 1: Add single quote
@@ -409,6 +700,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     
                     if self.verbose_testing:
                         self.log_test_detail("SQLi Step 1", param_name, quote, test_value1, status1, is_error1)
+                    
+                    # If single quote returns 200 OK, endpoint is likely safe
+                    if status1 == 200 and not is_error1:
+                        endpoint_safe = True
+                        if self.verbose_testing:
+                            self.log_test_result("SQLi", param_name, "SAFE - Single quote returned 200 OK (endpoint not vulnerable)")
+                        break
                     
                     if is_error1:
                         # Test 2: Add double quote to "fix" syntax
@@ -427,7 +725,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                                 self.log_sqli_vuln(messageInfo, param_name, quote, response1, response2, test_value1, test_value2)
                                 break  # Stop testing this parameter once SQLi is found
             
-            if self.verbose_testing and not sqli_found:
+            if self.verbose_testing and not sqli_found and not endpoint_safe:
                 self.log_test_result("SQLi", param_name, "SAFE - No SQL injection detected")
                         
         except Exception as e:
@@ -658,11 +956,59 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             
             if body_offset < len(response_bytes):
                 response_body = self.helpers.bytesToString(response_bytes[body_offset:])
-                return "asdf" in response_body
+                
+                # Check for unencoded reflection of "asdf" part
+                # XSS is only valid if the payload appears unencoded in response
+                if "asdf" in response_body:
+                    # Check if it's properly encoded (URL encoded or HTML encoded)
+                    if self.is_properly_encoded(response_body, payload):
+                        return False  # Properly encoded = not vulnerable
+                    else:
+                        return True   # Unencoded reflection = potentially vulnerable
             
             return False
         except Exception:
             return False
+    
+    def is_properly_encoded(self, response_body, original_payload):
+        """Check if XSS payload is properly encoded in response"""
+        try:
+            # Check for URL encoding patterns
+            url_encoded_patterns = [
+                "asdf%27",    # ' encoded as %27
+                "asdf%22",    # " encoded as %22  
+                "asdf%3e",    # > encoded as %3e
+                "asdf%3E"     # > encoded as %3E (uppercase)
+            ]
+            
+            # Check for HTML encoding patterns
+            html_encoded_patterns = [
+                "asdf&#39;",  # ' encoded as &#39;
+                "asdf&#34;",  # " encoded as &#34;
+                "asdf&gt;",   # > encoded as &gt;
+                "asdf&quot;", # " encoded as &quot;
+                "asdf&#x27;", # ' encoded as &#x27;
+                "asdf&#x22;"  # " encoded as &#x22;
+            ]
+            
+            response_lower = response_body.lower()
+            
+            # If we find encoded patterns, it's properly encoded
+            for pattern in url_encoded_patterns + html_encoded_patterns:
+                if pattern.lower() in response_lower:
+                    return True
+            
+            # If we find the raw payload characters unencoded, it's vulnerable
+            dangerous_chars = ["asdf'", 'asdf"', "asdf>"]
+            for char_combo in dangerous_chars:
+                if char_combo in response_body:
+                    return False  # Unencoded = vulnerable
+            
+            # If "asdf" exists but special chars are not found, assume encoded
+            return True
+            
+        except Exception:
+            return True  # Default to safe (encoded) on error
     
     def get_status_code(self, messageInfo):
         try:
@@ -696,4 +1042,5 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     
     def getUiComponent(self):
         return self.main_panel
+
 
