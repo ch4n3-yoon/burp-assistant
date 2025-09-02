@@ -696,3 +696,4 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     
     def getUiComponent(self):
         return self.main_panel
+
