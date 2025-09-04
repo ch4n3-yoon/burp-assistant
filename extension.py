@@ -161,6 +161,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             self.test_status_label.setText(test_status)
     
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+        if toolFlag != self.callbacks.TOOL_PROXY:
+            return
+  
         if self.logging_enabled:
             with self.log_lock:
                 try:
