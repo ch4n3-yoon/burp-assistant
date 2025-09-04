@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 
 from burp import IBurpExtender, IHttpListener, ITab
+from javax.swing import JPanel, JTextField, JCheckBox, JLabel, JButton, JTextArea, JScrollPane, JTabbedPane
 from java.awt import BorderLayout, GridBagLayout, GridBagConstraints, Dimension
 from java.awt.event import ActionListener
-from javax.swing import JPanel, JTextField, JCheckBox, JLabel, JButton, JTextArea, JScrollPane, JTabbedPane
-import datetime
 import threading
-import time
+import datetime
 import hashlib
+import random
+import string
+import time
+
+
+
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab):
     
@@ -23,6 +28,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.test_cache = {}
         self.cache_expiry = 3600
         self.test_count = 0
+
+    def _rand_token(self, n=8):
+        alphabet = string.ascii_letters + string.digits
+        return ''.join(random.choice(alphabet) for _ in range(n))
     
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
@@ -361,21 +370,22 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             
             # Clean parameter value - remove any existing quotes for testing
             clean_value = param_value.replace("'", "").replace('"', "").replace(">", "")
-            
-            xss_payload = "asdf'\">"
+
+            token = self._rand_token(8)
+            xss_payload = token + "'\">"
             test_value = clean_value + xss_payload
             
             response = self.send_test_request(messageInfo, param_name, test_value, param_type)
             
             if response:
                 status = self.get_status_code(response)
-                has_reflection = self.has_xss_reflection(response, xss_payload)
+                has_reflection = self.has_xss_reflection(response, token, xss_payload)
                 
                 if self.verbose_testing:
                     self.log_test_detail("XSS Test", param_name, xss_payload, test_value, status, has_reflection)
                 
                 if has_reflection:
-                    self.log_xss_vuln(messageInfo, param_name, xss_payload, response, test_value)
+                    self.log_xss_vuln(messageInfo, param_name, token, xss_payload, response, test_value)
                 elif self.verbose_testing:
                     self.log_test_result("XSS", param_name, "SAFE - No reflection detected")
                 
@@ -402,7 +412,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception as e:
             print("Test result log error: " + str(e))
     
-    def log_xss_vuln(self, messageInfo, param_name, payload, response, test_value):
+    def log_xss_vuln(self, messageInfo, param_name, token, payload, response, test_value):
         try:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             request_info = self.helpers.analyzeRequest(messageInfo)
@@ -426,7 +436,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     if body_offset < len(response_bytes):
                         try:
                             body = self.helpers.bytesToString(response_bytes[body_offset:])
-                            context = self.get_xss_context(body, "asdf")
+                            context = self.get_xss_context(body, token)
                             f.write("XSS REFLECTION CONTEXT:\n")
                             f.write(context + "\n")
                         except Exception:
@@ -567,7 +577,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception:
             return True
     
-    def has_xss_reflection(self, messageInfo, payload):
+    def has_xss_reflection(self, messageInfo, token, payload):
         try:
             if not messageInfo.getResponse():
                 return False
@@ -581,9 +591,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 
                 # Check for unencoded reflection of "asdf" part
                 # XSS is only valid if the payload appears unencoded in response
-                if "asdf" in response_body:
+                if token in response_body:
                     # Check if it's properly encoded (URL encoded or HTML encoded)
-                    if self.is_properly_encoded(response_body, payload):
+                    if self.is_properly_encoded(response_body, token):
                         return False  # Properly encoded = not vulnerable
                     else:
                         return True   # Unencoded reflection = potentially vulnerable
@@ -592,8 +602,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception:
             return False
     
-    def is_properly_encoded(self, response_body, original_payload):
-        """Check if XSS payload is properly encoded in response"""
+    def is_properly_encoded(self, response_body, token):
+        """Check if XSS payload is properly encoded in response"""  
         try:
             # Check for URL encoding patterns
             url_encoded_patterns = [
@@ -621,9 +631,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     return True
             
             # If we find the raw payload characters unencoded, it's vulnerable
-            dangerous_chars = ["asdf'", 'asdf"', "asdf>"]
-            for char_combo in dangerous_chars:
-                if char_combo in response_body:
+            dangerous_raw = [token + "'", token + '"', token + ">"]
+            for raw in dangerous_raw:
+                if raw in response_body:
                     return False  # Unencoded = vulnerable
             
             # If "asdf" exists but special chars are not found, assume encoded
