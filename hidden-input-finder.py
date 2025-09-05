@@ -1,401 +1,480 @@
 # -*- coding: utf-8 -*-
 from burp import IBurpExtender, IHttpListener, ITab
-from java.awt import Component, GridBagLayout, GridBagConstraints, Insets
-from java.awt.event import ActionListener, ActionEvent
+from java.awt import GridBagLayout, GridBagConstraints, Insets
+from java.awt.event import ActionListener
 from javax.swing import JPanel, JScrollPane, JTextArea, JButton, JLabel, JCheckBox
 from java.io import PrintWriter
+from java.net import URL
+
 import re
 import urllib
 import json
-from java.net import URL
+import os
+import time
+
+EXTENSION_NAME = "Hidden Input & POST Param Reflector"
+
+CACHE_FILE = "reflect_cache.json"   # JSON 캐시 파일
+SENTINEL_PARAM = "__hifr"           # 자기요청 식별용 쿼리 파라미터
+SENTINEL_HEADER = "X-HIFR"          # 자기요청 식별용 헤더
+SENTINEL_VALUE = "1"
+
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab, ActionListener):
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
-        
-        # Extension 정보 설정
-        callbacks.setExtensionName("Hidden Input & POST Param Reflector")
-        
-        # Output streams 설정
+
+        callbacks.setExtensionName(EXTENSION_NAME)
         self._stdout = PrintWriter(callbacks.getStdout(), True)
         self._stderr = PrintWriter(callbacks.getStderr(), True)
-        
-        # HTTP 리스너 등록
-        callbacks.registerHttpListener(self)
-        
-        # UI 초기화
-        self.initUI()
-        
-        # Tab 추가
-        callbacks.addSuiteTab(self)
-        
-        # 결과 저장용
+
+        # state
         self.scan_results = []
-        
-        # 테스트 페이로드
         self.test_payload = "asdf'\">"
-        
+        self.cache = {}
+        self._load_cache()
+
+        # UI
+        self._init_ui()
+        callbacks.addSuiteTab(self)
+
+        # HTTP listener
+        callbacks.registerHttpListener(self)
+
         self._stdout.println("Hidden Input & POST Param Reflector loaded successfully!")
-    
-    def initUI(self):
+
+    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
+        # Response만 처리
+        if messageIsRequest:
+            return
+        if not self._auto_scan_checkbox.isSelected():
+            return
+
+        try:
+            # 자기 자신이 만든 테스트 요청은 스킵(헤더, 쿼리 둘 다)
+            req = messageInfo.getRequest()
+            if not req:
+                return
+            req_info = self._helpers.analyzeRequest(messageInfo)
+            for h in req_info.getHeaders():
+                if h.lower().startswith((SENTINEL_HEADER + ":").lower()):
+                    return
+
+            url = str(messageInfo.getUrl())
+            if self._has_sentinel_param(url):
+                return
+
+            self._scan_for_reflection(messageInfo)
+
+        except Exception as e:
+            self._stderr.println("Error in processHttpMessage: " + str(e))
+
+    def getTabCaption(self):
+        return EXTENSION_NAME[0:10] + "..."
+
+    def getUiComponent(self):
+        return self._panel
+
+    def actionPerformed(self, event):
+        cmd = event.getActionCommand()
+        if cmd == "manual_scan":
+            selected = self._callbacks.getSelectedMessages()
+            if selected:
+                for item in selected:
+                    self._scan_for_reflection(item)
+        elif cmd == "clear":
+            self._results_area.setText("")
+            self.scan_results = []
+        elif cmd == "clear_cache":
+            self.cache = {}
+            self._save_cache()
+            self._log_result("[CACHE] Cleared reflect_cache.json")
+
+    def _init_ui(self):
         self._panel = JPanel(GridBagLayout())
-        constraints = GridBagConstraints()
-        
-        # 제목
-        constraints.gridx = 0
-        constraints.gridy = 0
-        constraints.gridwidth = 2
-        constraints.fill = GridBagConstraints.HORIZONTAL
-        constraints.insets = Insets(10, 10, 10, 10)
+        gc = GridBagConstraints()
+        gc.gridx = 0
+        gc.gridy = 0
+        gc.gridwidth = 2
+        gc.fill = GridBagConstraints.HORIZONTAL
+        gc.insets = Insets(10, 10, 10, 10)
+
         title_label = JLabel("Hidden Input & POST Param Reflector")
         title_label.setFont(title_label.getFont().deriveFont(16.0))
-        self._panel.add(title_label, constraints)
-        
-        # 설정 옵션들
-        constraints.gridy = 1
-        constraints.gridwidth = 1
+        self._panel.add(title_label, gc)
+
+        gc.gridy = 1
+        gc.gridwidth = 1
         self._auto_scan_checkbox = JCheckBox("Auto Scan on Response", True)
-        self._panel.add(self._auto_scan_checkbox, constraints)
-        
-        constraints.gridx = 1
+        self._panel.add(self._auto_scan_checkbox, gc)
+
+        gc.gridx = 1
         self._test_post_params_checkbox = JCheckBox("Test POST Parameters", True)
-        self._panel.add(self._test_post_params_checkbox, constraints)
-        
-        # 수동 스캔 버튼
-        constraints.gridx = 0
-        constraints.gridy = 2
-        constraints.gridwidth = 2
+        self._panel.add(self._test_post_params_checkbox, gc)
+
+        gc.gridx = 0
+        gc.gridy = 2
+        self._skip_cached_checkbox = JCheckBox("Skip Cached Tests", True)
+        self._panel.add(self._skip_cached_checkbox, gc)
+
+        gc.gridx = 1
+        clear_cache_btn = JButton("Clear Cache")
+        clear_cache_btn.addActionListener(self)
+        clear_cache_btn.setActionCommand("clear_cache")
+        self._panel.add(clear_cache_btn, gc)
+
+        gc.gridx = 0
+        gc.gridy = 3
+        gc.gridwidth = 2
         scan_button = JButton("Manual Scan Selected Request")
         scan_button.addActionListener(self)
         scan_button.setActionCommand("manual_scan")
-        self._panel.add(scan_button, constraints)
-        
-        # 결과 영역
-        constraints.gridy = 3
-        constraints.fill = GridBagConstraints.BOTH
-        constraints.weightx = 1.0
-        constraints.weighty = 1.0
-        constraints.insets = Insets(10, 10, 10, 10)
-        
+        self._panel.add(scan_button, gc)
+
+        gc.gridy = 4
+        gc.fill = GridBagConstraints.BOTH
+        gc.weightx = 1.0
+        gc.weighty = 1.0
+        gc.insets = Insets(10, 10, 10, 10)
         self._results_area = JTextArea(20, 80)
         self._results_area.setEditable(False)
-        scroll_pane = JScrollPane(self._results_area)
-        self._panel.add(scroll_pane, constraints)
-        
-        # 클리어 버튼
-        constraints.gridy = 4
-        constraints.fill = GridBagConstraints.HORIZONTAL
-        constraints.weighty = 0
+        self._panel.add(JScrollPane(self._results_area), gc)
+
+        gc.gridy = 5
+        gc.fill = GridBagConstraints.HORIZONTAL
+        gc.weighty = 0
         clear_button = JButton("Clear Results")
         clear_button.addActionListener(self)
         clear_button.setActionCommand("clear")
-        self._panel.add(clear_button, constraints)
-    
-    def getTabCaption(self):
-        return "Reflector Scanner"
-    
-    def getUiComponent(self):
-        return self._panel
-    
-    def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
-        # Response만 처리
-        if not messageIsRequest and self._auto_scan_checkbox.isSelected():
-            self.scanForReflection(messageInfo)
-    
-    def actionPerformed(self, event):
-        command = event.getActionCommand()
-        if command == "manual_scan":
-            # 선택된 요청에 대해 수동 스캔
-            selected_items = self._callbacks.getSelectedMessages()
-            if selected_items:
-                for item in selected_items:
-                    self.scanForReflection(item)
-        elif command == "clear":
-            self._results_area.setText("")
-            self.scan_results = []
-    
-    def scanForReflection(self, messageInfo):
+        self._panel.add(clear_button, gc)
+
+    def _scan_for_reflection(self, message_info):
         try:
-            response = messageInfo.getResponse()
-            request = messageInfo.getRequest()
+            response = message_info.getResponse()
+            request = message_info.getRequest()
             if not response or not request:
                 return
-            
-            response_info = self._helpers.analyzeResponse(response)
-            body_offset = response_info.getBodyOffset()
-            response_body = self._helpers.bytesToString(response[body_offset:])
-            
-            url = str(messageInfo.getUrl())
-            self.logResult("="*80)
-            self.logResult("URL: " + url)
-            
-            # 1. Hidden Input 스캔
-            hidden_inputs = self.findHiddenInputs(response_body)
+
+            resp_info = self._helpers.analyzeResponse(response)
+            body_offset = resp_info.getBodyOffset()
+            resp_body = self._helpers.bytesToString(response[body_offset:])
+
+            url = str(message_info.getUrl())
+            self._log_result("=" * 80)
+            self._log_result("URL: " + url)
+
+            # 1) Hidden inputs
+            hidden_inputs = self._find_hidden_inputs(resp_body)
             if hidden_inputs:
-                self.logResult("\n[HIDDEN INPUTS FOUND]")
-                self.logResult("Found {} hidden input(s):".format(len(hidden_inputs)))
-                
-                for input_data in hidden_inputs:
-                    self.logResult("  - Name: '{}', Value: '{}'".format(
-                        input_data['name'], input_data['value'][:100]))
-                
-                # Hidden input 반영 테스트
-                self.testHiddenInputReflection(messageInfo, hidden_inputs)
-            
-            # 2. POST 파라미터 스캔 (옵션이 활성화된 경우)
+                self._log_result("\n[HIDDEN INPUTS FOUND]")
+                self._log_result("Found {} hidden input(s):".format(len(hidden_inputs)))
+                for inp in hidden_inputs:
+                    self._log_result("  - Name: '{}', Value: '{}'".format(
+                        inp['name'], inp['value'][:100]))
+                self._test_hidden_input_reflection(message_info, hidden_inputs)
+
+            # 2) POST params -> test as GET
             if self._test_post_params_checkbox.isSelected():
-                post_params = self.extractPostParameters(request)
+                post_params = self._extract_post_parameters(request)
                 if post_params:
-                    self.logResult("\n[POST PARAMETERS FOUND]")
-                    self.logResult("Found {} POST parameter(s):".format(len(post_params)))
-                    
-                    for param_data in post_params:
-                        self.logResult("  - Name: '{}', Value: '{}'".format(
-                            param_data['name'], param_data['value'][:100]))
-                    
-                    # POST 파라미터를 GET으로 테스트
-                    self.testPostParamsAsGet(messageInfo, post_params)
-                
+                    self._log_result("\n[POST PARAMETERS FOUND]")
+                    self._log_result("Found {} POST parameter(s):".format(len(post_params)))
+                    for p in post_params:
+                        self._log_result("  - Name: '{}', Value: '{}'".format(p['name'], p['value'][:100]))
+                    self._test_post_params_as_get(message_info, post_params)
+
         except Exception as e:
-            self._stderr.println("Error in scanForReflection: " + str(e))
-    
-    def findHiddenInputs(self, html_content):
-        """HTML에서 hidden input 필드 찾기"""
+            self._stderr.println("Error in _scan_for_reflection: " + str(e))
+
+    def _find_hidden_inputs(self, html_content):
         hidden_inputs = []
-        
-        # 다양한 패턴으로 hidden input 매치
         patterns = [
             r'<input[^>]*type\s*=\s*["\']hidden["\'][^>]*>',
             r'<input[^>]*type\s*=\s*hidden[^>]*>'
         ]
-        
         for pattern in patterns:
-            matches = re.finditer(pattern, html_content, re.IGNORECASE)
-            for match in matches:
-                input_tag = match.group(0)
-                
-                # name 속성 추출
-                name_match = re.search(r'name\s*=\s*["\']([^"\']*)["\']', input_tag, re.IGNORECASE)
-                if not name_match:
-                    name_match = re.search(r'name\s*=\s*([^\s>]*)', input_tag, re.IGNORECASE)
-                
-                # value 속성 추출
-                value_match = re.search(r'value\s*=\s*["\']([^"\']*)["\']', input_tag, re.IGNORECASE)
-                if not value_match:
-                    value_match = re.search(r'value\s*=\s*([^\s>]*)', input_tag, re.IGNORECASE)
-                
-                if name_match:
-                    name = name_match.group(1)
-                    value = value_match.group(1) if value_match else ""
-                    
+            for m in re.finditer(pattern, html_content, re.IGNORECASE):
+                tag = m.group(0)
+                name_m = re.search(r'name\s*=\s*["\']([^"\']*)["\']', tag, re.IGNORECASE)
+                if not name_m:
+                    name_m = re.search(r'name\s*=\s*([^\s>]*)', tag, re.IGNORECASE)
+                value_m = re.search(r'value\s*=\s*["\']([^"\']*)["\']', tag, re.IGNORECASE)
+                if not value_m:
+                    value_m = re.search(r'value\s*=\s*([^\s>]*)', tag, re.IGNORECASE)
+                if name_m:
                     hidden_inputs.append({
-                        'name': name,
-                        'value': value,
-                        'full_tag': input_tag
+                        'name': name_m.group(1),
+                        'value': value_m.group(1) if value_m else "",
+                        'full_tag': tag
                     })
-        
         return hidden_inputs
-    
-    def extractPostParameters(self, request):
-        """POST 요청에서 파라미터 추출"""
+
+    def _extract_post_parameters(self, request_bytes):
         try:
-            request_info = self._helpers.analyzeRequest(request)
-            
-            # POST 요청인지 확인
-            method = request_info.getMethod()
-            if method != "POST":
+            req_info = self._helpers.analyzeRequest(request_bytes)
+            if req_info.getMethod() != "POST":
                 return []
-            
-            # Content-Type 확인
-            headers = request_info.getHeaders()
+
             content_type = ""
-            for header in headers:
-                if header.lower().startswith("content-type:"):
-                    content_type = header.lower()
+            for h in req_info.getHeaders():
+                if h.lower().startswith("content-type:"):
+                    content_type = h.lower()
                     break
-            
-            # application/x-www-form-urlencoded만 처리
             if "application/x-www-form-urlencoded" not in content_type:
                 return []
-            
-            # POST 바디에서 파라미터 추출
-            body_offset = request_info.getBodyOffset()
-            body = self._helpers.bytesToString(request[body_offset:])
-            
-            parameters = []
+
+            body_offset = req_info.getBodyOffset()
+            body = self._helpers.bytesToString(request_bytes[body_offset:])
+            params = []
             if body:
-                # URL 디코딩 후 파라미터 파싱
-                param_pairs = body.split('&')
-                for pair in param_pairs:
+                for pair in body.split('&'):
                     if '=' in pair:
                         name, value = pair.split('=', 1)
-                        name = urllib.unquote_plus(name)
-                        value = urllib.unquote_plus(value)
-                        parameters.append({
-                            'name': name,
-                            'value': value
+                        params.append({
+                            'name': urllib.unquote_plus(name),
+                            'value': urllib.unquote_plus(value)
                         })
-            
-            return parameters
-            
+            return params
         except Exception as e:
-            self._stderr.println("Error in extractPostParameters: " + str(e))
+            self._stderr.println("Error in _extract_post_parameters: " + str(e))
             return []
-    
-    def testHiddenInputReflection(self, original_message, hidden_inputs):
-        """Hidden input 반영 테스트"""
+
+    def _test_hidden_input_reflection(self, original_message, hidden_inputs):
         try:
             base_url = str(original_message.getUrl())
-            self.logResult("\n[HIDDEN INPUT REFLECTION TEST]")
-            
-            for input_data in hidden_inputs:
-                param_name = input_data['name']
-                original_value = input_data['value']
-                
-                # 원래 값에 테스트 페이로드 추가
-                test_value = original_value + self.test_payload
-                
-                self.logResult("\nTesting hidden input: '{}'".format(param_name))
-                self.logResult("  Original value: '{}'".format(original_value))
-                self.logResult("  Test value: '{}'".format(test_value))
-                
-                # GET 요청으로 테스트
-                test_url = self.buildTestURL(base_url, param_name, test_value)
-                
+            self._log_result("\n[HIDDEN INPUT REFLECTION TEST]")
+
+            for inp in hidden_inputs:
+                name = inp['name']
+                orig = inp['value']
+                test_value = orig + self.test_payload
+
+                method = "GET"
+                key = self._cache_key(method, base_url, name, test_value)
+                if self._skip_cached_checkbox.isSelected() and key in self.cache:
+                    entry = self.cache[key]
+                    self._log_result("  [CACHE HIT/SKIP] {} param='{}' vuln={} tested_at={}".format(
+                        method, name, entry.get("vulnerable"), entry.get("created_at")))
+                    continue
+
+                self._log_result("\nTesting hidden input: '{}'".format(name))
+                self._log_result("  Original value: '{}'".format(orig))
+                self._log_result("  Test value: '{}'".format(test_value))
+
+                test_url = self._build_test_url_replace_param(
+                    base_url, name, test_value, add_sentinel=True
+                )
+
                 try:
-                    # 새로운 요청 생성
-                    test_request = self._helpers.buildHttpRequest(URL(test_url))
-                    test_response = self._callbacks.makeHttpRequest(
-                        original_message.getHttpService(), test_request)
-                    
-                    if test_response and test_response.getResponse():
-                        response_body = self._helpers.bytesToString(
-                            test_response.getResponse())
-                        
-                        # 페이로드가 반영되었는지 확인
-                        if self.checkReflection(response_body, self.test_payload):
-                            self.logResult("  [REFLECTED] Payload found in response!")
-                            self.logResult("  Test URL: {}".format(test_url))
-                            
-                            # 반영된 부분의 컨텍스트 표시
-                            context = self.getReflectionContext(response_body, self.test_payload)
-                            if context:
-                                self.logResult("  Context: {}".format(context))
+                    req_bytes = self._helpers.buildHttpRequest(URL(test_url))
+                    req_info = self._helpers.analyzeRequest(req_bytes)
+                    headers = list(req_info.getHeaders())
+                    headers.append(SENTINEL_HEADER + ": " + SENTINEL_VALUE)
+                    new_req = self._helpers.buildHttpMessage(headers, None)
+
+                    test_resp = self._callbacks.makeHttpRequest(original_message.getHttpService(), new_req)
+                    vulnerable = False
+
+                    if test_resp and test_resp.getResponse():
+                        resp_body = self._helpers.bytesToString(test_resp.getResponse())
+                        if self._check_reflection(resp_body, self.test_payload):
+                            vulnerable = True
+                            self._log_result("  [REFLECTED] Payload found in response!")
+                            self._log_result("  Test URL: {}".format(test_url))
+                            ctx = self._get_reflection_context(resp_body, self.test_payload)
+                            if ctx:
+                                self._log_result("  Context: {}".format(ctx))
                         else:
-                            self.logResult("  [NOT REFLECTED] Payload not found in response")
-                            
+                            self._log_result("  [NOT REFLECTED] Payload not found in response")
+
+                    self._write_cache_entry(key, method, base_url, name, test_value, vulnerable)
+
                 except Exception as e:
-                    self.logResult("  Error testing: {}".format(str(e)))
-                    
+                    self._log_result("  Error testing: {}".format(str(e)))
+
         except Exception as e:
-            self._stderr.println("Error in testHiddenInputReflection: " + str(e))
-    
-    def testPostParamsAsGet(self, original_message, post_params):
-        """POST 파라미터를 GET으로 테스트"""
+            self._stderr.println("Error in _test_hidden_input_reflection: " + str(e))
+
+    def _test_post_params_as_get(self, original_message, post_params):
         try:
-            base_url = str(original_message.getUrl()).split('?')[0]  # 기존 쿼리 파라미터 제거
-            self.logResult("\n[POST PARAMETERS AS GET TEST]")
-            
-            for param_data in post_params:
-                param_name = param_data['name']
-                original_value = param_data['value']
-                
-                # 원래 값에 테스트 페이로드 추가
-                test_value = original_value + self.test_payload
-                
-                self.logResult("\nTesting POST param as GET: '{}'".format(param_name))
-                self.logResult("  Original value: '{}'".format(original_value))
-                self.logResult("  Test value: '{}'".format(test_value))
-                
-                # GET 요청으로 테스트
-                test_url = self.buildTestURL(base_url, param_name, test_value)
-                
+            full = str(original_message.getUrl())
+            base_no_query = full.split('?', 1)[0]
+            self._log_result("\n[POST PARAMETERS AS GET TEST]")
+
+            for p in post_params:
+                name = p['name']
+                orig = p['value']
+                test_value = orig + self.test_payload
+
+                method = "GET"
+                key = self._cache_key(method, base_no_query, name, test_value)
+                if self._skip_cached_checkbox.isSelected() and key in self.cache:
+                    entry = self.cache[key]
+                    self._log_result("  [CACHE HIT/SKIP] {} param='{}' vuln={} tested_at={}".format(
+                        method, name, entry.get("vulnerable"), entry.get("created_at")))
+                    continue
+
+                self._log_result("\nTesting POST param as GET: '{}'".format(name))
+                self._log_result("  Original value: '{}'".format(orig))
+                self._log_result("  Test value: '{}'".format(test_value))
+
+                test_url = self._build_test_url_replace_param(
+                    base_no_query, name, test_value, add_sentinel=True
+                )
+
                 try:
-                    # 새로운 요청 생성
-                    test_request = self._helpers.buildHttpRequest(URL(test_url))
-                    test_response = self._callbacks.makeHttpRequest(
-                        original_message.getHttpService(), test_request)
-                    
-                    if test_response and test_response.getResponse():
-                        response_body = self._helpers.bytesToString(
-                            test_response.getResponse())
-                        
-                        # 페이로드가 반영되었는지 확인
-                        if self.checkReflection(response_body, self.test_payload):
-                            self.logResult("  [REFLECTED] POST param works as GET!")
-                            self.logResult("  Test URL: {}".format(test_url))
-                            
-                            # 반영된 부분의 컨텍스트 표시
-                            context = self.getReflectionContext(response_body, self.test_payload)
-                            if context:
-                                self.logResult("  Context: {}".format(context))
+                    req_bytes = self._helpers.buildHttpRequest(URL(test_url))
+                    req_info = self._helpers.analyzeRequest(req_bytes)
+                    headers = list(req_info.getHeaders())
+                    headers.append(SENTINEL_HEADER + ": " + SENTINEL_VALUE)
+                    new_req = self._helpers.buildHttpMessage(headers, None)
+
+                    test_resp = self._callbacks.makeHttpRequest(original_message.getHttpService(), new_req)
+                    vulnerable = False
+
+                    if test_resp and test_resp.getResponse():
+                        resp_body = self._helpers.bytesToString(test_resp.getResponse())
+                        if self._check_reflection(resp_body, self.test_payload):
+                            vulnerable = True
+                            self._log_result("  [REFLECTED] POST param works as GET!")
+                            self._log_result("  Test URL: {}".format(test_url))
+                            ctx = self._get_reflection_context(resp_body, self.test_payload)
+                            if ctx:
+                                self._log_result("  Context: {}".format(ctx))
                         else:
-                            self.logResult("  [NOT REFLECTED] POST param doesn't work as GET")
-                            
+                            self._log_result("  [NOT REFLECTED] POST param doesn't work as GET")
+
+                    self._write_cache_entry(key, method, base_no_query, name, test_value, vulnerable)
+
                 except Exception as e:
-                    self.logResult("  Error testing: {}".format(str(e)))
-                    
+                    self._log_result("  Error testing: {}".format(str(e)))
+
         except Exception as e:
-            self._stderr.println("Error in testPostParamsAsGet: " + str(e))
-    
-    def buildTestURL(self, base_url, param_name, value):
-        """테스트용 URL 생성"""
-        separator = "&" if "?" in base_url else "?"
-        encoded_value = urllib.quote(value, safe='')
-        return "{}{}{}={}".format(base_url, separator, param_name, encoded_value)
-    
-    def checkReflection(self, response_body, payload):
-        """페이로드 반영 여부 확인"""
-        # 직접 반영 확인
+            self._stderr.println("Error in _test_post_params_as_get: " + str(e))
+
+    # ---- URL helpers ----
+    def _build_test_url_replace_param(self, base_url, param_name, value, add_sentinel=True):
+        """
+        기존 쿼리를 파싱해 동일 파라미터는 덮어쓰고, 필요 시 센티널(__hifr=1) 추가.
+        """
+        if '?' in base_url:
+            path, query = base_url.split('?', 1)
+        else:
+            path, query = base_url, ""
+
+        pairs = []
+        if query:
+            for part in query.split('&'):
+                if not part:
+                    continue
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                else:
+                    k, v = part, ""
+                if urllib.unquote_plus(k) == param_name:
+                    continue
+                if urllib.unquote_plus(k) == SENTINEL_PARAM:
+                    continue
+                pairs.append((k, v))
+
+        enc_name = urllib.quote(param_name, safe='')
+        enc_val = urllib.quote(value, safe='')
+        pairs.append((enc_name, enc_val))
+        if add_sentinel:
+            pairs.append((SENTINEL_PARAM, SENTINEL_VALUE))
+
+        new_query = "&".join(["{}={}".format(k, v) if v != "" else k for (k, v) in pairs])
+        return "{}?{}".format(path, new_query) if new_query else path
+
+    def _has_sentinel_param(self, url_str):
+        if '?' not in url_str:
+            return False
+        _, q = url_str.split('?', 1)
+        for part in q.split('&'):
+            if '=' in part:
+                k, v = part.split('=', 1)
+            else:
+                k, v = part, ""
+            if urllib.unquote_plus(k) == SENTINEL_PARAM and urllib.unquote_plus(v) == SENTINEL_VALUE:
+                return True
+        return False
+
+    # ---- Reflection checks ----
+    def _check_reflection(self, response_body, payload):
         if payload in response_body:
             return True
-        
-        # URL 인코딩된 버전 확인
-        encoded_payload = urllib.quote(payload, safe='')
-        if encoded_payload in response_body:
+        enc = urllib.quote(payload, safe='')
+        if enc in response_body:
             return True
-        
-        # HTML 엔티티 인코딩된 버전 확인 (부분적으로)
-        html_encoded_versions = [
+        html_variants = [
             payload.replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#x27;'),
             payload.replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&apos;'),
-            payload.replace('"', '&quot;').replace("'", '&#39;')
+            payload.replace('"', '&quot;').replace("'", '&#39;'),
         ]
-        
-        for encoded in html_encoded_versions:
-            if encoded in response_body:
+        for v in html_variants:
+            if v in response_body:
                 return True
-        
         return False
-    
-    def getReflectionContext(self, response_body, payload):
-        """반영 컨텍스트 추출"""
+
+    def _get_reflection_context(self, response_body, payload):
         try:
-            payload_pos = response_body.find(payload)
-            if payload_pos == -1:
-                # 인코딩된 버전 찾기
-                encoded_payload = urllib.quote(payload, safe='')
-                payload_pos = response_body.find(encoded_payload)
-                if payload_pos == -1:
+            pos = response_body.find(payload)
+            if pos == -1:
+                enc = urllib.quote(payload, safe='')
+                pos = response_body.find(enc)
+                if pos == -1:
                     return "Context not found"
-            
-            # 앞뒤 50자씩 추출
-            start = max(0, payload_pos - 50)
-            end = min(len(response_body), payload_pos + len(payload) + 50)
-            context = response_body[start:end]
-            
-            # 줄바꿈 제거하고 공백 정리
-            context = re.sub(r'\s+', ' ', context).strip()
-            
-            return context
-            
+            start = max(0, pos - 50)
+            end = min(len(response_body), pos + len(payload) + 50)
+            ctx = response_body[start:end]
+            return re.sub(r'\s+', ' ', ctx).strip()
         except Exception as e:
             return "Error extracting context: " + str(e)
-    
-    def logResult(self, message):
-        """결과 로깅"""
-        current_text = self._results_area.getText()
-        self._results_area.setText(current_text + message + "\n")
+
+    # ---- JSON cache ----
+    def _cache_key(self, method, url_or_base, param, test_value):
+        base = url_or_base.split('?', 1)[0]
+        return "{}||{}||{}||{}".format(method.upper(), base, param, test_value)
+
+    def _load_cache(self):
+        try:
+            if os.path.exists(CACHE_FILE):
+                with open(CACHE_FILE, "r") as f:
+                    self.cache = json.load(f)
+            else:
+                self.cache = {}
+        except Exception as e:
+            self.cache = {}
+            try:
+                os.remove(CACHE_FILE)
+            except:
+                pass
+            self._stderr.println("Failed to load cache, reinitialized: " + str(e))
+
+    def _save_cache(self):
+        try:
+            with open(CACHE_FILE, "w") as f:
+                json.dump(self.cache, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self._stderr.println("Failed to save cache: " + str(e))
+
+    def _write_cache_entry(self, key, method, url_or_base, param, test_value, vulnerable):
+        entry = {
+            "method": method.upper(),
+            "url": url_or_base.split('?', 1)[0],
+            "parameter": param,
+            "tested_value": test_value,
+            "vulnerable": bool(vulnerable),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+        self.cache[key] = entry
+        self._save_cache()
+        self._log_result("  [CACHE WRITE] {}".format(entry))
+
+    # ---- logging ----
+    def _log_result(self, message):
+        current = self._results_area.getText()
+        self._results_area.setText(current + message + "\n")
         self._results_area.setCaretPosition(self._results_area.getDocument().getLength())
         self._stdout.println(message)
