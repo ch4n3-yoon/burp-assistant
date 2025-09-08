@@ -28,6 +28,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.test_cache = {}
         self.cache_expiry = 3600
         self.test_count = 0
+        self.ignore_static_enabled = True
+        self.ignored_extensions = set([
+            ".gif", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".svg", ".ico",
+            ".css", ".js", ".map", ".wasm",
+            ".woff", ".woff2", ".ttf", ".eot", ".otf",
+            ".mp4", ".mp3", ".webm", ".mkv", ".avi", ".mov", ".m4a", ".m3u8",
+            ".pdf", ".zip", ".rar", ".7z", ".gz", ".tar"
+        ])
 
     def _rand_token(self, n=8):
         alphabet = string.ascii_letters + string.digits
@@ -172,7 +180,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         if toolFlag != self.callbacks.TOOL_PROXY:
             return
-  
+        
         if self.logging_enabled:
             with self.log_lock:
                 try:
@@ -181,6 +189,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     print("Log error: " + str(e))
         
         if self.auto_test_enabled and messageIsRequest:
+            # Skip obviously static assets (.gif, .js, .png, ...)
+            if self.should_ignore_request(messageInfo):
+                return
+            
             try:
                 self.perform_security_tests(messageInfo)
             except Exception as e:
@@ -266,8 +278,42 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         binary_types = ["image/", "video/", "audio/", "application/pdf", "application/zip", "application/octet-stream", "font/"]
         return any(content_type.startswith(bt) for bt in binary_types)
     
+    def should_ignore_request(self, messageInfo):
+        """
+        정적 자원으로 '확실히' 보이는 요청/응답을 통째로 무시.
+        조건: 메서드 GET/HEAD/OPTIONS 이고, URL path 가 알려진 정적 확장자로 끝나는 경우
+        """
+        try:
+            if not self.ignore_static_enabled:
+                return False
+
+            req_info = self.helpers.analyzeRequest(messageInfo)
+            method = req_info.getMethod()
+            if method not in ("GET", "HEAD", "OPTIONS"):
+                return False
+
+            url_obj = req_info.getUrl()
+            path = url_obj.getPath() if hasattr(url_obj, "getPath") else str(url_obj)
+            if not path:
+                return False
+
+            last_seg = path.lower().split("/")[-1]
+            if "." not in last_seg:
+                return False  # 확장자 없음 -> 건너뛰지 않음
+
+            ext = "." + last_seg.split(".")[-1]
+            return ext in self.ignored_extensions
+
+        except Exception:
+            # 안전 측면에서 에러 시에는 무시하지 않고 진행 (fail-open)
+            return False
+
+
     def perform_security_tests(self, messageInfo):
         try:
+            if self.should_ignore_request(messageInfo):
+                return
+
             request_info = self.helpers.analyzeRequest(messageInfo)
             parameters = request_info.getParameters()
             
