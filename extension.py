@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from burp import IBurpExtender, IHttpListener, ITab
+from burp import IBurpExtender, IHttpListener, ITab, IParameter
 from javax.swing import JPanel, JTextField, JCheckBox, JLabel, JButton, JTextArea, JScrollPane, JTabbedPane
 from java.awt import BorderLayout, GridBagLayout, GridBagConstraints, Dimension
 from java.awt.event import ActionListener
@@ -10,33 +10,39 @@ import hashlib
 import random
 import string
 import time
-
-
+import re
 
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab):
     
     def __init__(self):
+        # --- Files/flags ---
         self.log_file_path = "burp_http_log.txt"
         self.vuln_log_path = "burp_vulnerabilities.txt"
         self.test_log_path = "burp_test_results.txt"
         self.logging_enabled = True
         self.auto_test_enabled = True
         self.verbose_testing = True
-        self.log_lock = threading.Lock()
-        self.request_cache = {}
-        self.test_cache = {}
-        self.cache_expiry = 3600
-        self.test_count = 0
-        self.ignore_static_enabled = True
-        self.ignored_extensions = set([
-            ".gif", ".png", ".jpg", ".jpeg", ".bmp", ".webp", ".svg", ".ico",
-            ".css", ".js", ".map", ".wasm",
-            ".woff", ".woff2", ".ttf", ".eot", ".otf",
-            ".mp4", ".mp3", ".webm", ".mkv", ".avi", ".mov", ".m4a", ".m3u8",
-            ".pdf", ".zip", ".rar", ".7z", ".gz", ".tar"
-        ])
 
+        # --- Concurrency/caches ---
+        self.log_lock = threading.Lock()
+        self.request_cache = {}   # (test_key) -> response
+        self.test_cache = {}      # (cache_key) -> last_test_time
+        self.cache_expiry = 3600  # seconds
+        self.test_count = 0
+
+        # --- Static (MIME) skipping controls ---
+        self.ignore_static_enabled = True
+        self.static_cache = {}            # (cache_key) -> last_seen_time
+        self.static_cache_expiry = 3600   # seconds
+
+        # --- Cookie testing policy ---
+        self.skip_cookie_xss = True
+        self.sqli_cookie_exclude_regexes = [
+            re.compile(r'^_ga$'),
+            re.compile(r'^_ga_[A-Za-z0-9]+$'),
+        ]
+    
     def _rand_token(self, n=8):
         alphabet = string.ascii_letters + string.digits
         return ''.join(random.choice(alphabet) for _ in range(n))
@@ -177,27 +183,60 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 test_status = "Security Testing: DISABLED"
             self.test_status_label.setText(test_status)
     
+    # ------------ Core HTTP hook ------------
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         if toolFlag != self.callbacks.TOOL_PROXY:
             return
-        
+
+        # Keep local toggles synced with UI if needed
+        self.logging_enabled = self.enable_logging_checkbox.isSelected() if hasattr(self, 'enable_logging_checkbox') else self.logging_enabled
+        self.auto_test_enabled = self.auto_test_checkbox.isSelected() if hasattr(self, 'auto_test_checkbox') else self.auto_test_enabled
+        self.verbose_testing = self.verbose_test_checkbox.isSelected() if hasattr(self, 'verbose_test_checkbox') else self.verbose_testing
+
+        now = time.time()
+        cache_key = self.get_cache_key(messageInfo)
+
+        # If we already determined (recently) that this URL is static, skip early
+        if self.ignore_static_enabled and cache_key in self.static_cache:
+            if now - self.static_cache[cache_key] < self.static_cache_expiry:
+                # Skip both logging and testing for this message
+                return
+            else:
+                # Expired
+                del self.static_cache[cache_key]
+
+        if messageIsRequest:
+            # We no longer run tests at request-time because we want MIME-based decision.
+            if self.logging_enabled:
+                with self.log_lock:
+                    try:
+                        self.write_log_entry(toolFlag, messageIsRequest, messageInfo)
+                    except Exception as e:
+                        print("Log error: " + str(e))
+            return  # Wait for the response to decide testing/logging continuation
+
+        # messageIsRequest == False (RESPONSE)
+        # Decide static by MIME (Content-Type) from *response*
+        if self.ignore_static_enabled and self.should_ignore_by_mime(messageInfo):
+            # Memorize so future requests to same URL are skipped at request-time
+            self.static_cache[cache_key] = now
+            return  # Skip logging (response) and tests entirely
+
+        # Not static: log response and run tests
         if self.logging_enabled:
             with self.log_lock:
                 try:
                     self.write_log_entry(toolFlag, messageIsRequest, messageInfo)
                 except Exception as e:
                     print("Log error: " + str(e))
-        
-        if self.auto_test_enabled and messageIsRequest:
-            # Skip obviously static assets (.gif, .js, .png, ...)
-            if self.should_ignore_request(messageInfo):
-                return
-            
+
+        if self.auto_test_enabled:
             try:
                 self.perform_security_tests(messageInfo)
             except Exception as e:
                 print("Test error: " + str(e))
     
+    # ------------ Logging ------------
     def write_log_entry(self, toolFlag, messageIsRequest, messageInfo):
         with open(self.log_file_path, 'a') as f:
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -273,45 +312,50 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             if header.lower().startswith("content-type:"):
                 return header.split(":", 1)[1].strip().lower()
         return "unknown"
-    
+
+    # 기존 바이너리 판별은 유지 (로깅 바디 출력 판단용)
     def is_binary_content(self, content_type):
         binary_types = ["image/", "video/", "audio/", "application/pdf", "application/zip", "application/octet-stream", "font/"]
         return any(content_type.startswith(bt) for bt in binary_types)
-    
-    def should_ignore_request(self, messageInfo):
-        """
-        정적 자원으로 '확실히' 보이는 요청/응답을 통째로 무시.
-        조건: 메서드 GET/HEAD/OPTIONS 이고, URL path 가 알려진 정적 확장자로 끝나는 경우
-        """
-        try:
-            if not self.ignore_static_enabled:
-                return False
 
-            req_info = self.helpers.analyzeRequest(messageInfo)
-            method = req_info.getMethod()
-            if method not in ("GET", "HEAD", "OPTIONS"):
-                return False
-
-            url_obj = req_info.getUrl()
-            path = url_obj.getPath() if hasattr(url_obj, "getPath") else str(url_obj)
-            if not path:
-                return False
-
-            last_seg = path.lower().split("/")[-1]
-            if "." not in last_seg:
-                return False  # 확장자 없음 -> 건너뛰지 않음
-
-            ext = "." + last_seg.split(".")[-1]
-            return ext in self.ignored_extensions
-
-        except Exception:
-            # 안전 측면에서 에러 시에는 무시하지 않고 진행 (fail-open)
+    # 정적 리소스 판별: MIME 기반 (패스 여부 결정용)
+    def is_static_mime(self, content_type):
+        if not content_type or content_type == "unknown":
             return False
+        # prefix 매칭
+        if content_type.startswith(("image/", "video/", "audio/", "font/")):
+            return True
+        # exact 매칭
+        static_exact = set([
+            "text/css",
+            "application/javascript",
+            "text/javascript",
+            "application/x-javascript",
+            "application/wasm",
+            "application/pdf",
+            "application/zip",
+            "application/x-zip-compressed",
+            "application/octet-stream",
+        ])
+        return content_type in static_exact
 
-
+    def should_ignore_by_mime(self, messageInfo):
+        """응답의 Content-Type이 정적(이미지/JS/CSS/폰트/바이너리 등)으로 보이면 True."""
+        try:
+            if not messageInfo or not messageInfo.getResponse():
+                return False
+            response_info = self.helpers.analyzeResponse(messageInfo.getResponse())
+            headers = response_info.getHeaders()
+            ctype = self.get_content_type(headers)
+            return self.is_static_mime(ctype)
+        except Exception:
+            return False
+    
+    # ------------ Testing ------------
     def perform_security_tests(self, messageInfo):
         try:
-            if self.should_ignore_request(messageInfo):
+            # 가드: 혹시라도 정적이면 중복 방지
+            if self.should_ignore_by_mime(messageInfo):
                 return
 
             request_info = self.helpers.analyzeRequest(messageInfo)
@@ -332,12 +376,40 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             for param in parameters:
                 self.test_count += 1
                 self.log_test_attempt(messageInfo, param)
-                self.test_sqli(messageInfo, param)
-                self.test_xss(messageInfo, param)
+
+                # COOKIE → XSS 미검사, SQLi는 조건부
+                if param.getType() == IParameter.PARAM_COOKIE:
+                    # XSS는 스킵
+                    # (원한다면 verbose 로그 남김)
+                    if self.verbose_testing:
+                        self.log_test_result("XSS", param.getName(), "SKIPPED - Cookie parameter")
+
+                    # SQLi는 트래킹 쿠키 예외 적용
+                    if self.is_tracking_cookie_for_sqli_exclusion(param.getName()):
+                        if self.verbose_testing:
+                            self.log_test_result("SQLi", param.getName(), "SKIPPED - Tracking cookie")
+                    else:
+                        self.test_sqli(messageInfo, param)
+
+                else:
+                    # 일반 파라미터: 둘 다 검사
+                    self.test_sqli(messageInfo, param)
+                    self.test_xss(messageInfo, param)
+
                 self.update_status()
                 
         except Exception as e:
             print("Security test error: " + str(e))
+
+    def is_tracking_cookie_for_sqli_exclusion(self, cookie_name):
+        try:
+            name = cookie_name or ""
+            for rgx in self.sqli_cookie_exclude_regexes:
+                if rgx.match(name):
+                    return True
+            return False
+        except Exception:
+            return False
     
     def log_test_attempt(self, messageInfo, param):
         if not self.verbose_testing:
@@ -367,14 +439,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             param_name = param.getName()
             param_value = param.getValue()
             param_type = param.getType()
-            
-            # Clean parameter value - remove any existing quotes for testing
+
+            # 트래킹 쿠키 예외는 perform_security_tests에서 이미 처리됨
+            # 값 정리
             clean_value = param_value.replace("'", "").replace('"', "")
-            
             sqli_found = False
             
             for quote in ["'", '"']:
-                # Test 1: Add single quote
+                # Step 1: 구문 깨뜨리기
                 test_value1 = clean_value + quote
                 response1 = self.send_test_request(messageInfo, param_name, test_value1, param_type)
                 
@@ -386,7 +458,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                         self.log_test_detail("SQLi Step 1", param_name, quote, test_value1, status1, is_error1)
                     
                     if is_error1:
-                        # Test 2: Add double quote to "fix" syntax
+                        # Step 2: "복구" 시도
                         test_value2 = clean_value + quote + quote
                         response2 = self.send_test_request(messageInfo, param_name, test_value2, param_type)
                         
@@ -400,7 +472,7 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                             if not is_error2:
                                 sqli_found = True
                                 self.log_sqli_vuln(messageInfo, param_name, quote, response1, response2, test_value1, test_value2)
-                                break  # Stop testing this parameter once SQLi is found
+                                break  # 이 파라미터에 대해 SQLi 발견 시 중단
             
             if self.verbose_testing and not sqli_found:
                 self.log_test_result("SQLi", param_name, "SAFE - No SQL injection detected")
@@ -410,11 +482,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     
     def test_xss(self, messageInfo, param):
         try:
+            # COOKIE 파라미터는 XSS 검사 제외
+            if param.getType() == IParameter.PARAM_COOKIE:
+                if self.verbose_testing:
+                    self.log_test_result("XSS", param.getName(), "SKIPPED - Cookie parameter")
+                return
+
             param_name = param.getName()
             param_value = param.getValue()
             param_type = param.getType()
             
-            # Clean parameter value - remove any existing quotes for testing
+            # 값 정리
             clean_value = param_value.replace("'", "").replace('"', "").replace(">", "")
 
             token = self._rand_token(8)
@@ -635,58 +713,51 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             if body_offset < len(response_bytes):
                 response_body = self.helpers.bytesToString(response_bytes[body_offset:])
                 
-                # Check for unencoded reflection of "asdf" part
-                # XSS is only valid if the payload appears unencoded in response
+                # 토큰이 그대로 반사되었는지 확인 (HTML/URL 엔코딩 여부 고려)
                 if token in response_body:
-                    # Check if it's properly encoded (URL encoded or HTML encoded)
                     if self.is_properly_encoded(response_body, token):
-                        return False  # Properly encoded = not vulnerable
+                        return False  # 적절히 인코딩 → 취약 아님
                     else:
-                        return True   # Unencoded reflection = potentially vulnerable
-            
+                        return True   # 인코딩 없이 반사 → 잠재적 취약
             return False
         except Exception:
             return False
     
     def is_properly_encoded(self, response_body, token):
-        """Check if XSS payload is properly encoded in response"""  
+        """XSS 토큰이 적절히 인코딩되어 있는지 확인 (토큰 기준으로 동작하도록 수정)"""
         try:
-            # Check for URL encoding patterns
+            # URL 인코딩 패턴
             url_encoded_patterns = [
-                "asdf%27",    # ' encoded as %27
-                "asdf%22",    # " encoded as %22  
-                "asdf%3e",    # > encoded as %3e
-                "asdf%3E"     # > encoded as %3E (uppercase)
+                token + "%27",    # ' → %27
+                token + "%22",    # " → %22
+                token + "%3e",    # > → %3e
+                token + "%3E",    # > → %3E
             ]
-            
-            # Check for HTML encoding patterns
+            # HTML 인코딩 패턴
             html_encoded_patterns = [
-                "asdf&#39;",  # ' encoded as &#39;
-                "asdf&#34;",  # " encoded as &#34;
-                "asdf&gt;",   # > encoded as &gt;
-                "asdf&quot;", # " encoded as &quot;
-                "asdf&#x27;", # ' encoded as &#x27;
-                "asdf&#x22;"  # " encoded as &#x22;
+                token + "&#39;",   # ' → &#39;
+                token + "&#34;",   # " → &#34;
+                token + "&gt;",    # > → &gt;
+                token + "&quot;",  # " → &quot;
+                token + "&#x27;",  # ' → &#x27;
+                token + "&#x22;",  # " → &#x22;
             ]
-            
-            response_lower = response_body.lower()
-            
-            # If we find encoded patterns, it's properly encoded
-            for pattern in url_encoded_patterns + html_encoded_patterns:
-                if pattern.lower() in response_lower:
-                    return True
-            
-            # If we find the raw payload characters unencoded, it's vulnerable
+            lower_body = response_body.lower()
+            lower_patterns = [p.lower() for p in url_encoded_patterns + html_encoded_patterns]
+            for p in lower_patterns:
+                if p in lower_body:
+                    return True  # 인코딩되어 있음
+
+            # 위험한 생(raw) 조합이 있으면 인코딩 안 된 것으로 판단
             dangerous_raw = [token + "'", token + '"', token + ">"]
             for raw in dangerous_raw:
                 if raw in response_body:
-                    return False  # Unencoded = vulnerable
-            
-            # If "asdf" exists but special chars are not found, assume encoded
+                    return False  # 인코딩 안 됨 = 취약
+
+            # 토큰이 존재하지만 위험 문자들이 보이지 않으면 인코딩된 것으로 간주
             return True
-            
         except Exception:
-            return True  # Default to safe (encoded) on error
+            return True  # 보수적으로 안전하다고 판단
     
     def get_status_code(self, messageInfo):
         try:
