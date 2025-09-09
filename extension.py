@@ -11,6 +11,7 @@ import random
 import string
 import time
 import re
+import os
 
 
 class BurpExtender(IBurpExtender, IHttpListener, ITab):
@@ -20,13 +21,15 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         self.log_file_path = "burp_http_log.txt"
         self.vuln_log_path = "burp_vulnerabilities.txt"
         self.test_log_path = "burp_test_results.txt"
+        self.artifacts_root = "vuln_artifacts"
         self.logging_enabled = True
         self.auto_test_enabled = True
         self.verbose_testing = True
 
         # --- Concurrency/caches ---
         self.log_lock = threading.Lock()
-        self.request_cache = {}   # (test_key) -> response
+        self.fs_lock = threading.Lock()
+        self.request_cache = {}   # (test_key) -> (response, modified_request_bytes)
         self.test_cache = {}      # (cache_key) -> last_test_time
         self.cache_expiry = 3600  # seconds
         self.test_count = 0
@@ -206,21 +209,21 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                 del self.static_cache[cache_key]
 
         if messageIsRequest:
-            # We no longer run tests at request-time because we want MIME-based decision.
+            # Log only request here; testing will be decided after response (MIME-based)
             if self.logging_enabled:
                 with self.log_lock:
                     try:
                         self.write_log_entry(toolFlag, messageIsRequest, messageInfo)
                     except Exception as e:
                         print("Log error: " + str(e))
-            return  # Wait for the response to decide testing/logging continuation
+            return  # Wait for the response
 
         # messageIsRequest == False (RESPONSE)
-        # Decide static by MIME (Content-Type) from *response*
+        # Decide static by MIME (Content-Type) from response
         if self.ignore_static_enabled and self.should_ignore_by_mime(messageInfo):
             # Memorize so future requests to same URL are skipped at request-time
             self.static_cache[cache_key] = now
-            return  # Skip logging (response) and tests entirely
+            return  # Skip logging (response) and tests
 
         # Not static: log response and run tests
         if self.logging_enabled:
@@ -379,12 +382,9 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
                 # COOKIE → XSS 미검사, SQLi는 조건부
                 if param.getType() == IParameter.PARAM_COOKIE:
-                    # XSS는 스킵
-                    # (원한다면 verbose 로그 남김)
                     if self.verbose_testing:
                         self.log_test_result("XSS", param.getName(), "SKIPPED - Cookie parameter")
 
-                    # SQLi는 트래킹 쿠키 예외 적용
                     if self.is_tracking_cookie_for_sqli_exclusion(param.getName()):
                         if self.verbose_testing:
                             self.log_test_result("SQLi", param.getName(), "SKIPPED - Tracking cookie")
@@ -440,19 +440,17 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             param_value = param.getValue()
             param_type = param.getType()
 
-            # 트래킹 쿠키 예외는 perform_security_tests에서 이미 처리됨
-            # 값 정리
             clean_value = param_value.replace("'", "").replace('"', "")
             sqli_found = False
             
             for quote in ["'", '"']:
                 # Step 1: 구문 깨뜨리기
                 test_value1 = clean_value + quote
-                response1 = self.send_test_request(messageInfo, param_name, test_value1, param_type)
+                resp1, req1_bytes = self.send_test_request(messageInfo, param_name, test_value1, param_type)
                 
-                if response1:
-                    status1 = self.get_status_code(response1)
-                    is_error1 = self.is_error_response(response1)
+                if resp1:
+                    status1 = self.get_status_code(resp1)
+                    is_error1 = self.is_error_response(resp1)
                     
                     if self.verbose_testing:
                         self.log_test_detail("SQLi Step 1", param_name, quote, test_value1, status1, is_error1)
@@ -460,18 +458,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
                     if is_error1:
                         # Step 2: "복구" 시도
                         test_value2 = clean_value + quote + quote
-                        response2 = self.send_test_request(messageInfo, param_name, test_value2, param_type)
+                        resp2, req2_bytes = self.send_test_request(messageInfo, param_name, test_value2, param_type)
                         
-                        if response2:
-                            status2 = self.get_status_code(response2)
-                            is_error2 = self.is_error_response(response2)
+                        if resp2:
+                            status2 = self.get_status_code(resp2)
+                            is_error2 = self.is_error_response(resp2)
                             
                             if self.verbose_testing:
                                 self.log_test_detail("SQLi Step 2", param_name, quote + quote, test_value2, status2, is_error2)
                             
                             if not is_error2:
                                 sqli_found = True
-                                self.log_sqli_vuln(messageInfo, param_name, quote, response1, response2, test_value1, test_value2)
+                                # 아티팩트 저장
+                                self.save_sqli_artifacts(
+                                    messageInfo,
+                                    param_name,
+                                    quote,
+                                    test_value1, req1_bytes, resp1,
+                                    test_value2, req2_bytes, resp2
+                                )
+                                # 텍스트 로그도 유지
+                                self.log_sqli_vuln(messageInfo, param_name, quote, resp1, resp2, test_value1, test_value2)
                                 break  # 이 파라미터에 대해 SQLi 발견 시 중단
             
             if self.verbose_testing and not sqli_found:
@@ -482,7 +489,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
     
     def test_xss(self, messageInfo, param):
         try:
-            # COOKIE 파라미터는 XSS 검사 제외
             if param.getType() == IParameter.PARAM_COOKIE:
                 if self.verbose_testing:
                     self.log_test_result("XSS", param.getName(), "SKIPPED - Cookie parameter")
@@ -492,24 +498,26 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             param_value = param.getValue()
             param_type = param.getType()
             
-            # 값 정리
             clean_value = param_value.replace("'", "").replace('"', "").replace(">", "")
 
             token = self._rand_token(8)
             xss_payload = token + "'\">"
             test_value = clean_value + xss_payload
             
-            response = self.send_test_request(messageInfo, param_name, test_value, param_type)
+            resp, req_bytes = self.send_test_request(messageInfo, param_name, test_value, param_type)
             
-            if response:
-                status = self.get_status_code(response)
-                has_reflection = self.has_xss_reflection(response, token, xss_payload)
+            if resp:
+                status = self.get_status_code(resp)
+                has_reflection = self.has_xss_reflection(resp, token, xss_payload)
                 
                 if self.verbose_testing:
                     self.log_test_detail("XSS Test", param_name, xss_payload, test_value, status, has_reflection)
                 
                 if has_reflection:
-                    self.log_xss_vuln(messageInfo, param_name, token, xss_payload, response, test_value)
+                    # 아티팩트 저장
+                    self.save_xss_artifacts(messageInfo, param_name, token, xss_payload, test_value, req_bytes, resp)
+                    # 텍스트 로그도 유지
+                    self.log_xss_vuln(messageInfo, param_name, token, xss_payload, resp, test_value)
                 elif self.verbose_testing:
                     self.log_test_result("XSS", param_name, "SAFE - No reflection detected")
                 
@@ -669,7 +677,162 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
         except Exception:
             return "Error context extraction failed"
     
+    # -------- Artifact persistence (NEW) --------
+    def sanitize_for_path(self, s):
+        try:
+            # Windows/Unix 공통적으로 문제되는 문자 제거
+            return re.sub(r'[^A-Za-z0-9._\-@+=]', '_', s or '')
+        except Exception:
+            return "unknown"
+
+    def ensure_dir(self, path):
+        with self.fs_lock:
+            if not os.path.isdir(path):
+                try:
+                    os.makedirs(path)
+                except Exception as e:
+                    print("Failed to create directory: %s (%s)" % (path, str(e)))
+
+    def now_stamp(self):
+        return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def dump_bytes_to_text_or_bin(self, base_path_without_ext, data_bytes):
+        """
+        data_bytes를 문자열로 디코딩해 .txt 저장을 시도하고, 실패하면 .bin으로 저장.
+        반환: 실제 저장된 파일 경로 (str)
+        """
+        try:
+            # Burp helpers는 바이트를 문자열로 바꿔주나, 여기서는 원본 보존이 목적 → 우선 bytesToString 시도
+            text = self.helpers.bytesToString(data_bytes)
+            out_path = base_path_without_ext + ".txt"
+            with open(out_path, "w") as f:
+                f.write(text)
+            return out_path
+        except Exception:
+            # 디코딩 실패 → 바이너리로 저장
+            out_path = base_path_without_ext + ".bin"
+            try:
+                with open(out_path, "wb") as f:
+                    # Jython 환경에서 bytes-like 처리
+                    f.write(bytearray(data_bytes))
+            except Exception as e:
+                print("Failed to write binary: %s" % str(e))
+            return out_path
+
+    def save_meta_file(self, folder, meta_dict):
+        try:
+            meta_path = os.path.join(folder, "meta.txt")
+            lines = []
+            for k in sorted(meta_dict.keys()):
+                v = meta_dict[k]
+                lines.append("%s: %s" % (k, v))
+            with open(meta_path, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            return meta_path
+        except Exception as e:
+            print("Failed to write meta: %s" % str(e))
+            return None
+
+    def get_resp_bytes(self, resp_msg):
+        try:
+            return resp_msg.getResponse()
+        except Exception:
+            return None
+
+    def save_xss_artifacts(self, original_messageInfo, param_name, token, payload, test_value, req_bytes, resp_msg):
+        try:
+            host = self.sanitize_for_path(original_messageInfo.getHttpService().getHost())
+            url = str(self.helpers.analyzeRequest(original_messageInfo).getUrl())
+            url_safe = self.sanitize_for_path(url)[:120]
+            param_safe = self.sanitize_for_path(param_name)
+            stamp = self.now_stamp()
+            rid = self._rand_token(6)
+
+            base_dir = os.path.join(self.artifacts_root, host)
+            self.ensure_dir(base_dir)
+
+            finding_dir_name = "%s__XSS__%s__%s" % (stamp, param_safe, rid)
+            finding_dir = os.path.join(base_dir, finding_dir_name)
+            self.ensure_dir(finding_dir)
+
+            # 메타정보 저장
+            meta = {
+                "Type": "XSS",
+                "Host": host,
+                "URL": url,
+                "Param": param_name,
+                "Token": token,
+                "Payload": payload,
+                "TestValue": test_value,
+                "DetectedAt": stamp,
+            }
+            self.save_meta_file(finding_dir, meta)
+
+            # 요청/응답 원문 저장
+            if req_bytes:
+                self.dump_bytes_to_text_or_bin(os.path.join(finding_dir, "request"), req_bytes)
+
+            resp_bytes = self.get_resp_bytes(resp_msg)
+            if resp_bytes:
+                self.dump_bytes_to_text_or_bin(os.path.join(finding_dir, "response"), resp_bytes)
+
+            # 결과창에 경로 안내
+            self.results_area.append("Artifacts saved: %s\n" % finding_dir)
+        except Exception as e:
+            print("save_xss_artifacts error: %s" % str(e))
+
+    def save_sqli_artifacts(self, original_messageInfo, param_name, quote, test_value1, req1_bytes, resp1_msg, test_value2, req2_bytes, resp2_msg):
+        try:
+            host = self.sanitize_for_path(original_messageInfo.getHttpService().getHost())
+            url = str(self.helpers.analyzeRequest(original_messageInfo).getUrl())
+            url_safe = self.sanitize_for_path(url)[:120]
+            param_safe = self.sanitize_for_path(param_name)
+            stamp = self.now_stamp()
+            rid = self._rand_token(6)
+
+            base_dir = os.path.join(self.artifacts_root, host)
+            self.ensure_dir(base_dir)
+
+            finding_dir_name = "%s__SQLi__%s__%s" % (stamp, param_safe, rid)
+            finding_dir = os.path.join(base_dir, finding_dir_name)
+            self.ensure_dir(finding_dir)
+
+            meta = {
+                "Type": "SQLi(two-step heuristic)",
+                "Host": host,
+                "URL": url,
+                "Param": param_name,
+                "QuoteUsed": quote,
+                "Step1_TestValue": test_value1,
+                "Step2_TestValue": test_value2,
+                "DetectedAt": stamp,
+            }
+            self.save_meta_file(finding_dir, meta)
+
+            # Step 1 (에러 유도)
+            if req1_bytes:
+                self.dump_bytes_to_text_or_bin(os.path.join(finding_dir, "request_error"), req1_bytes)
+            resp1_bytes = self.get_resp_bytes(resp1_msg)
+            if resp1_bytes:
+                self.dump_bytes_to_text_or_bin(os.path.join(finding_dir, "response_error"), resp1_bytes)
+
+            # Step 2 (복구 성공)
+            if req2_bytes:
+                self.dump_bytes_to_text_or_bin(os.path.join(finding_dir, "request_success"), req2_bytes)
+            resp2_bytes = self.get_resp_bytes(resp2_msg)
+            if resp2_bytes:
+                self.dump_bytes_to_text_or_bin(os.path.join(finding_dir, "response_success"), resp2_bytes)
+
+            self.results_area.append("Artifacts saved: %s\n" % finding_dir)
+        except Exception as e:
+            print("save_sqli_artifacts error: %s" % str(e))
+
+    # -------- Request/Response helpers --------
     def send_test_request(self, original_messageInfo, param_name, new_value, param_type):
+        """
+        변경: (responseMessage, modified_request_bytes) 튜플을 반환.
+        캐시 히트 시에도 같은 튜플 반환.
+        """
         try:
             test_key = self.get_test_key(original_messageInfo, param_name, new_value)
             
@@ -683,18 +846,18 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab):
             http_service = original_messageInfo.getHttpService()
             response = self.callbacks.makeHttpRequest(http_service, modified_request)
             
-            self.request_cache[test_key] = response
-            return response
+            result = (response, modified_request)
+            self.request_cache[test_key] = result
+            return result
             
         except Exception as e:
             print("Send request error: " + str(e))
-            return None
+            return (None, None)
     
     def is_error_response(self, messageInfo):
         try:
             if not messageInfo.getResponse():
                 return True
-            
             response_info = self.helpers.analyzeResponse(messageInfo.getResponse())
             status_code = response_info.getStatusCode()
             return status_code >= 400
